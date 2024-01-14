@@ -3,10 +3,7 @@
 #include "gcm.h"
 #include "mbusparser.h"
 #include "secrets.h"
-
-#define DEBUG_BEGIN Serial.begin(115200);
-#define DEBUG_PRINT(x) Serial.print(x);sendmsg(String(mqtt_topic)+"/status",x);
-#define DEBUG_PRINTLN(x) Serial.println(x);sendmsg(String(mqtt_topic)+"/status",x);
+#include <ArduinoOTA.h>
 
 const size_t headersize = 11;
 const size_t footersize = 3;
@@ -18,90 +15,102 @@ VectorView decryptedFrame(decryptedFrameBuffer, 0);
 MbusStreamParser streamParser(receiveBuffer, sizeof(receiveBuffer));
 mbedtls_gcm_context m_ctx;
 
-// wifi auto reconnect
-unsigned long currentMillis;
-unsigned long previousMillis;
-unsigned long wifiReconnectInterval = 30000;
-
 WiFiClient espClient;
-PubSubClient client(espClient);
+PubSubClient mqttClient(espClient);
+
+unsigned long currentMillis;
+
+unsigned long latestReceivedDataMillis;
+const unsigned long expectedDataInterval = 15000;
 
 void setup() {
-  //DEBUG_BEGIN
-  //DEBUG_PRINTLN("")
-  Serial.begin(115200);
-  Serial.println(" I can print something");
-  pinMode(BUILTIN_LED, OUTPUT);
-  
+  delay(10000);
 
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  for (int i = 0; i < 5; i++)
+  {
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(500);
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(500);
+  }
+  
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.println("Connecting to WiFi..");
   }
-  Serial.println("Connected to the WiFi network");
 
-  client.setServer(mqttServer, mqttPort);
-  
-  while (!client.connected()) {
-    Serial.println("Connecting to MQTT...");
+  ArduinoOTA.setPort(8266);
+  ArduinoOTA.setHostname(otaHostname);
+  ArduinoOTA.setPassword(otaPassword);
 
-    if (client.connect(mqttClientID, mqttUser, mqttPassword )) {
-
-      Serial.println("connected");
-
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
     } else {
-
-      Serial.print("failed with state ");
-      Serial.print(client.state());
-      delay(2000);
-
+      type = "filesystem";
     }
+  });
+
+  ArduinoOTA.onEnd([]() {});
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {});
+  ArduinoOTA.onError([](ota_error_t error) {});
+  ArduinoOTA.begin();
+
+  mqttClient.setServer(mqttServer, mqttPort);
+  
+  while (!mqttClient.connected()) {
+    mqttClient.connect(mqttClientID, mqttUser, mqttPassword, (String(mqtt_topic) + "/status/esp").c_str(), 0, true, "offline");
   }
 
-  Serial.begin(2400, SERIAL_8N1);
+  mqttClient.publish((String(mqtt_topic) + "/status/esp").c_str(), "online", true);
+
+  Serial.begin(2400);
   Serial.swap();
+  
   hexStr2bArr(encryption_key, conf_key, sizeof(encryption_key));
   hexStr2bArr(authentication_key, conf_authkey, sizeof(authentication_key));
-  Serial.println("Setup completed");
-  digitalWrite(BUILTIN_LED, HIGH);
 }
 
 void loop() {
+  currentMillis = millis();
+
   while (Serial.available() > 0) {
-    //for(int i=0;i<sizeof(input);i++){
     if (streamParser.pushData(Serial.read())) {
-      //  if (streamParser.pushData(input[i])) {
       VectorView frame = streamParser.getFrame();
       if (streamParser.getContentType() == MbusStreamParser::COMPLETE_FRAME) {
-        DEBUG_PRINTLN("Frame complete");
         if (!decrypt(frame))
         {
-          DEBUG_PRINTLN("Decryption failed");
+          latestReceivedDataMillis = currentMillis;
+          sendmsg(String(mqtt_topic) + "/status/kamstrup", "decryption failed");
           return;
         }
+        latestReceivedDataMillis = currentMillis;
+        sendmsg(String(mqtt_topic) + "/status/kamstrup", "ok");
+
         MeterData md = parseMbusFrame(decryptedFrame);
         sendData(md);
+      }
+      else
+      {
+        latestReceivedDataMillis = currentMillis;
+        sendmsg(String(mqtt_topic) + "/status/kamstrup", "parsing failed");
       }
     }
   }
 
-  reconnectWifi();
-
-  client.loop();
-}
-
-void reconnectWifi() {
-  currentMillis = millis();
-  // if WiFi is down, try reconnecting
-  if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousMillis >= wifiReconnectInterval)) {
-    Serial.print(millis());
-    Serial.println("Reconnecting to WiFi...");
-    WiFi.disconnect();
-    WiFi.reconnect();
-    previousMillis = currentMillis;
+  if (currentMillis - latestReceivedDataMillis > expectedDataInterval)
+  {
+    latestReceivedDataMillis = currentMillis;
+    sendmsg(String(mqtt_topic) + "/status/kamstrup", "missing output");
   }
+  
+  ArduinoOTA.handle();
+  mqttClient.loop();
 }
 
 
@@ -173,22 +182,10 @@ void sendData(MeterData md) {
     sendmsg(String(mqtt_topic) + "/energy/reactiveExportKWh", String(md.reactiveExportWh / 1000.));
 }
 
-void printHex(const unsigned char* data, const size_t length) {
-  for (int i = 0; i < length; i++) {
-    Serial.printf("%02X", data[i]);
-  }
-}
-
-void printHex(const VectorView& frame) {
-  for (int i = 0; i < frame.size(); i++) {
-    Serial.printf("%02X", frame[i]);
-  }
-}
-
 bool decrypt(const VectorView& frame) {
 
   if (frame.size() < headersize + footersize + 12 + 18) {
-    Serial.println("Invalid frame size.");
+    return false;
   }
 
   memcpy(decryptedFrameBuffer, &frame.front(), frame.size());
@@ -214,17 +211,17 @@ bool decrypt(const VectorView& frame) {
 
   mbedtls_gcm_init(&m_ctx);
   int success = mbedtls_gcm_setkey(&m_ctx, MBEDTLS_CIPHER_ID_AES, encryption_key, sizeof(encryption_key) * 8);
+  
   if (0 != success) {
-    Serial.println("Setkey failed: " + String(success));
     return false;
   }
   success = mbedtls_gcm_auth_decrypt(&m_ctx, sizeof(cipher_text), initialization_vector, sizeof(initialization_vector),
                                      additional_authenticated_data, sizeof(additional_authenticated_data), authentication_tag, sizeof(authentication_tag),
                                      cipher_text, plaintext);
   if (0 != success) {
-    Serial.println("authdecrypt failed: " + String(success));
     return false;
   }
+
   mbedtls_gcm_free(&m_ctx);
 
   //copy replace encrypted data with decrypted for mbusparser library. Checksum not updated. Hopefully not needed
@@ -249,14 +246,10 @@ void hexStr2bArr(uint8_t* dest, const char* source, int bytes_n)
 
 
 void sendmsg(String topic, String payload) {
-  if (client.connected() && WiFi.status() == WL_CONNECTED) {
-    digitalWrite(BUILTIN_LED, LOW);
-    // If we are connected to WiFi and MQTT, send. (From Niels Ørbæk)
-    client.publish(topic.c_str(), payload.c_str());
+  if (mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
+    mqttClient.publish(topic.c_str(), payload.c_str());
     delay(10);
-    digitalWrite(BUILTIN_LED, HIGH);
   } else {
-    // Otherwise, restart the chip, hoping that the issue resolved itself.
     delay(60*1000);
     ESP.restart();
   }

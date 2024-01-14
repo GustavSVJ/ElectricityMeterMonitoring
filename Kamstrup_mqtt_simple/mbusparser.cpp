@@ -140,9 +140,6 @@ MeterData parseMbusFrame(const VectorView& frame)
 
   if (frame.front() == 0x7E && frame.back() == 0x7E) {
     if (frameFormat == 0xA0) {
-      // TODO: Parse header
-      // TODO: Parse datetime
-      // TODO: Parse elements sequentially
       result.activePowerPlus = getPower(frame, ACTIVE_POWER_PLUS, result.activePowerPlusValid);
       result.activePowerMinus = getPower(frame, ACTIVE_POWER_MINUS, result.activePowerMinusValid);
       result.reactivePowerPlus = getPower(frame, REACTIVE_POWER_PLUS, result.reactivePowerPlusValid);
